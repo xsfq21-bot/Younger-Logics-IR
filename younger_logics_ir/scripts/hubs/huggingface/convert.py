@@ -19,10 +19,14 @@ import onnx
 import tqdm
 import pathlib
 import multiprocessing
+import gymnasium
+import torch
+import sys
+
 
 from typing import Any, Literal, Callable
 
-from huggingface_hub import login, hf_hub_download, snapshot_download, utils
+from huggingface_hub import login, hf_hub_download, snapshot_download, utils, HfApi
 
 from younger.commons.io import saves_json, loads_json, save_json, load_json, create_dir, delete_dir, get_human_readable_size_representation
 from younger.commons.hash import hash_string
@@ -38,7 +42,52 @@ from younger_logics_ir.scripts.commons.utils import get_onnx_opset_versions, get
 
 from .utils import get_huggingface_hub_model_readme, get_huggingface_hub_model_siblings, clean_huggingface_hub_model_cache, infer_supported_frameworks, is_permanent_error, get_minimum_opset_from_error
 
+import torch
+import gymnasium
 
+
+class SB3MathWrapper(torch.nn.Module):
+    def __init__(self, core_net, algo, is_dict, keys, is_discrete):
+        super().__init__()
+        
+        self.core_net = core_net
+        
+        self.algo = algo
+        self.is_dict = is_dict
+        self.keys = keys
+        self.is_discrete = is_discrete
+
+    def forward(self, *args):
+        
+        if self.is_dict:
+            obs = {k: v for k, v in zip(self.keys, args)}
+        else:
+            obs = args[0]
+            
+        if self.algo in ["DQN", "QRDQN"]:
+            return self.core_net(obs)
+            
+        elif self.algo in ["SAC", "TD3", "DDPG", "TQC"]:
+            features = self.core_net.extract_features(obs, self.core_net.features_extractor)
+            latent_pi = self.core_net.latent_pi(features)
+            mean_actions = self.core_net.mu(latent_pi)
+            if self.algo in ["SAC", "TQC"]:
+                return torch.tanh(mean_actions)
+            return mean_actions
+            
+        else: # PPO, A2C
+            features = self.core_net.extract_features(obs)
+            if self.core_net.share_features_extractor:
+                latent_pi, _ = self.core_net.mlp_extractor(features)
+            else:
+                pi_features, _ = features
+                latent_pi = self.core_net.mlp_extractor.forward_actor(pi_features)
+                
+            mean_actions = self.core_net.action_net(latent_pi)
+            if self.is_discrete:
+                return torch.argmax(mean_actions, dim=1)
+            return mean_actions
+        
 def clean_cache(model_id: str, cvt_cache_dirpath: pathlib.Path, ofc_cache_dirpath: pathlib.Path):
     delete_dir(cvt_cache_dirpath, only_clean=True)
     clean_huggingface_hub_model_cache(model_id, ofc_cache_dirpath)
@@ -221,112 +270,72 @@ def safe_sb3_export(model_id: str, sb3_model_path: pathlib.Path, onnx_model_path
     import torch
     import gymnasium
     import stable_baselines3
+    import sys
 
     sb3_algorithm_names = set(['ppo', 'a2c', 'dqn', 'sac', 'td3', 'ddpg'])
-    def infer_sb3_algorithm(model_id: str, sb3_model_path: pathlib.Path) -> Literal['ppo', 'a2c', 'dqn', 'sac', 'td3', 'ddpg'] | None:
-        # First, try to infer the algorithm from the model file name.
-        for sb3_algorithm_name in sb3_algorithm_names:
-            if sb3_algorithm_name in sb3_model_path.name.lower():
-                return sb3_algorithm_name
-
-        # If that fails, try to infer the algorithm from the model ID.
-        for sb3_algorithm_name in sb3_algorithm_names:
-            if sb3_algorithm_name in model_id.lower():
-                return sb3_algorithm_name
-
+    def infer_sb3_algorithm(model_id: str, sb3_model_path: pathlib.Path):
+        for name in sb3_algorithm_names:
+            if name in sb3_model_path.name.lower(): return name
+        for name in sb3_algorithm_names:
+            if name in model_id.lower(): return name
         return None
 
-    def load_sb3_model(sb3_model_path: pathlib.Path, sb3_algorithm_name: Literal['ppo', 'a2c', 'dqn', 'sac', 'td3', 'ddpg'] | None):
+    def load_sb3_model(sb3_model_path: pathlib.Path, sb3_algorithm_name: str | None):
+        custom_objects = {"optimize_memory_usage": False, "handle_timeout_termination": False}
         if sb3_algorithm_name is None:
-            for sb3_algorithm_name in sb3_algorithm_names:
+            for name in sb3_algorithm_names:
                 try:
-                    return stable_baselines3.__dict__[sb3_algorithm_name.upper()].load(sb3_model_path, device='cpu', custom_objects={"optimize_memory_usage": False, "handle_timeout_termination": False})
+                    # load on cpu
+                    return stable_baselines3.__dict__[name.upper()].load(sb3_model_path, device='cpu', custom_objects=custom_objects)
                 except Exception:
                     continue
-            raise ValueError(f"Current model at {sb3_model_path} could not be loaded because the algorithm could not be inferred, this may indicate an unsupported algorithm.")
+            raise ValueError(f"Could not load {sb3_model_path}.")
         else:
-            return stable_baselines3.__dict__[sb3_algorithm_name.upper()].load(sb3_model_path, custom_objects={"optimize_memory_usage": False, "handle_timeout_termination": False})
-
-    class PureMathWrapper:
-        #Bypasses the strict probability distribution check in PyTorch 2.0+ Dynamo 
-        #by manually mapping the pure mathematical tensor flow.
-        def __init__(self, model):
-            self.model_name = model.__class__.__name__
-            self.action_space = model.action_space
-            self.observation_space = model.observation_space
-
-            # Security interceptor: Block RNNs and Mask mechanisms to prevent ONNX graph explosion
-            # Keep extraction conservative. RNN/maskable policies often need
-            # additional state inputs that this generic exporter does not support.
-            if 'recurrent' in self.model_name.lower() or 'maskable' in self.model_name.lower():
-                raise NotImplementedError(f'Unsupported SB3 family for export: {self.model_name}.')
-
-            if self.model_name.upper() in {'SAC', 'TD3', 'DDPG', 'TQC'}:
-                self.net = model.policy.actor
-            elif self.model_name.upper() in {'DQN', 'QRDQN'}:
-                self.net = model.policy.q_net
-            else:
-                # Covers PPO, A2C, TRPO, etc.
-                self.net = model.policy
-
-            self.is_dict = isinstance(model.observation_space, gymnasium.spaces.Dict)
-            if self.is_dict:
-                self.keys = list(model.observation_space.spaces.keys())
-            else:
-                self.keys = list()
-
-        def __call__(self, *args):
-            return self.forward(*args)
-
-        def eval(self):
-            self.net.eval()
-            return self
-
-        def forward(self, *args):
-            if self.is_dict:
-                observations = {k: v for k, v in zip(self.keys, args)}
-            else:
-                observations = args[0]
-
-            if self.model_name.upper() in {'DQN', 'QRDQN', 'TD3', 'DDPG'}:
-                return self.net(observations)
-
-            if self.model_name.upper() in {'SAC', 'TQC'}:
-                features = self.net.extract_features(observations, self.net.features_extractor)
-                latent_pi = self.net.latent_pi(features)
-                return torch.tanh(self.net.mu(latent_pi))
-
-            features = self.net.extract_features(observations)
-            if self.net.share_features_extractor:
-                latent_pi, _ = self.net.mlp_extractor(features)
-            else:
-                latent_pi = self.net.mlp_extractor.forward_actor(features[0])
-
-            mean_actions = self.net.action_net(latent_pi)
-            if isinstance(self.action_space, gymnasium.spaces.Discrete):
-                return torch.argmax(mean_actions, dim=1)
-            return mean_actions
+            return stable_baselines3.__dict__[sb3_algorithm_name.upper()].load(sb3_model_path, device='cpu', custom_objects=custom_objects)
 
     try:
-        sb3_algorithm_name = infer_sb3_algorithm(model_id, sb3_model_path)
-        model = load_sb3_model(sb3_model_path, sb3_algorithm_name)
-        model= PureMathWrapper(model)
-        model.eval()
+        algo = infer_sb3_algorithm(model_id, sb3_model_path)
+        model = load_sb3_model(sb3_model_path, algo)
+        
+        algo_name = model.__class__.__name__
+        if 'recurrent' in algo_name.lower() or 'maskable' in algo_name.lower():
+            raise NotImplementedError(f'Unsupported SB3 family: {algo_name}')
 
-        if model.is_dict:
-            dummy_input = tuple(torch.randn(1, *model.observation_space.spaces[key].shape) for key in model.keys)
-            input_names = [f'input_{key}' for key in model.keys]
+        if algo_name.upper() in {'SAC', 'TD3', 'DDPG', 'TQC'}:
+            core_net = model.policy.actor
+        elif algo_name.upper() in {'DQN', 'QRDQN'}:
+            core_net = model.policy.q_net
         else:
-            dummy_input = (torch.randn(1, *model.observation_space), )
+            core_net = model.policy
+
+        is_dict = isinstance(model.observation_space, gymnasium.spaces.Dict)
+        keys = list(model.observation_space.spaces.keys()) if is_dict else []
+        is_discrete = isinstance(model.action_space, gymnasium.spaces.Discrete)
+
+        print(f"\n Handling {algo_name} policy\n", file=sys.stderr)
+
+        wrapped_model = SB3MathWrapper(core_net, algo_name.upper(), is_dict, keys, is_discrete)
+        wrapped_model.eval()
+
+    
+        model_device = next(wrapped_model.parameters()).device
+
+        if is_dict:
+            dummy_input = tuple(torch.randn(1, *model.observation_space.spaces[k].shape).to(model_device) for k in keys)
+            input_names = [f'input_{k}' for k in keys]
+        else:
+            dummy_input = (torch.randn(1, *model.observation_space.shape).to(model_device), )
             input_names = ['input_observation']
 
-        torch.onnx.export(model, dummy_input, onnx_model_path, opset_version=onnx_opset_version, input_names=input_names, output_names=['output_action'])
+        torch.onnx.export(wrapped_model, dummy_input, onnx_model_path, opset_version=onnx_opset_version, input_names=input_names, output_names=['output_action'])
         this_status = 'success'
+        
     except Exception as exception:
         this_status = 'convert_error'
+        import traceback
+        print(f"\n Fail. {model_id} Caused by ：\n{traceback.format_exc()}\n", file=sys.stderr)
     finally:
         results_queue.put(this_status)
-
 
 def convert_sb3(model_id: str, cvt_cache_dirpath: pathlib.Path, ofc_cache_dirpath: pathlib.Path, device: Literal['cpu', 'cuda'] = 'cpu', library_name: str | None = None) -> tuple[dict[str, dict[int, Literal['success', 'oversize', 'access_deny', 'convert_error', 'system_kill', 'logicx_error']]], list[Instance], list[str]]:
     status: dict[str, dict[int, Literal['success', 'oversize', 'access_deny', 'convert_error', 'system_kill', 'logicx_error']]] = dict()
@@ -574,7 +583,7 @@ def convert_onnx(model_id: str, cvt_cache_dirpath: pathlib.Path, ofc_cache_dirpa
     return status, instances, artifacts
 
 
-def get_model_infos_and_convert_method(model_infos_filepath: pathlib.Path, framework: Literal['optimum', 'onnx', 'keras', 'tflite', 'stable_baselines3'], model_size_limit: tuple[int, int]) -> tuple[list[dict[str, Any]], Callable[[str, pathlib.Path, pathlib.Path, Literal['cpu', 'cuda']], tuple[dict[str, dict[int, Any] | Literal['system_kill']], list[Instance], list[str]]]]:
+def get_model_infos_and_convert_method(model_infos_filepath: pathlib.Path, framework: Literal['optimum', 'onnx', 'keras', 'tflite', 'stable_baselines3']) -> tuple[list[dict[str, Any]], Callable[[str, pathlib.Path, pathlib.Path, Literal['cpu', 'cuda']], tuple[dict[str, dict[int, Any] | Literal['system_kill']], list[Instance], list[str]]]]:
     # This is the convert order.
     supported_frameworks: list[str] = ['optimum', 'onnx', 'keras', 'tflite', 'stable_baselines3']
     supported_convert_methods: dict[str, Callable[[str, pathlib.Path, pathlib.Path, Literal['cpu', 'cuda'], str | None], tuple[dict[str, dict[int, Any] | Literal['system_kill']], list[Instance], list[str]]]] = dict(
@@ -596,22 +605,23 @@ def get_model_infos_and_convert_method(model_infos_filepath: pathlib.Path, frame
     model_infos: list[dict[str, Any]] = list()
     for model_info in load_json(model_infos_filepath):
         model_frameworks = get_model_frameworks(infer_supported_frameworks(model_info))
-        used_storage = model_info.get('usedStorage', 0)
-        if framework in model_frameworks and model_size_limit[0] <= used_storage and used_storage <= model_size_limit[1]:
+        if "stable-baselines3" in model_info.get("tags", []) and "stable_baselines3" not in model_frameworks:
+            model_frameworks.append("stable_baselines3")
+        if framework in model_frameworks:
             model_infos.append(model_info)
 
     convert_method = supported_convert_methods[framework]
     return model_infos, convert_method
 
 
-def get_convert_status_and_last_handled_model_id(sts_cache_dirpath: pathlib.Path, framework: Literal['optimum', 'onnx', 'keras', 'tflite', 'stable_baselines3'], model_size_limit: tuple[int, int]) -> tuple[list[dict[str, dict[int, Any]]], str | None]:
+def get_convert_status_and_last_handled_model_id(sts_cache_dirpath: pathlib.Path, framework: Literal['optimum', 'onnx', 'keras', 'tflite', 'stable_baselines3']) -> tuple[list[dict[str, dict[int, Any]]], str | None]:
     convert_status: dict[str, dict[int, Any]] = list()
-    specific_status_filepath = sts_cache_dirpath.joinpath(f'{framework}_{model_size_limit[0]}_{model_size_limit[1]}.sts')
+    specific_status_filepath = sts_cache_dirpath.joinpath(f'{framework}.sts')
     if specific_status_filepath.is_file():
         with open(specific_status_filepath, 'r') as specific_status_file:
             convert_status: dict[str, dict[int, Any]] = [loads_json(line.strip()) for line in specific_status_file]
 
-    last_handled_filepath = sts_cache_dirpath.joinpath(f'{framework}_{model_size_limit[0]}_{model_size_limit[1]}_last_handled.sts')
+    last_handled_filepath = sts_cache_dirpath.joinpath(f'{framework}_last_handled.sts')
     if last_handled_filepath.is_file():
         with open(last_handled_filepath, 'r') as last_handled_file:
             model_id = last_handled_file.read().strip()
@@ -621,12 +631,12 @@ def get_convert_status_and_last_handled_model_id(sts_cache_dirpath: pathlib.Path
     return convert_status, last_handled_model_id
 
 
-def set_convert_status_last_handled_model_id(sts_cache_dirpath: pathlib.Path, framework: Literal['optimum', 'onnx', 'keras', 'tflite', 'stable_baselines3'], model_size_limit: tuple[int, int], convert_status: dict[str, dict[str, Any]], model_id: str):
-    convert_status_filepath = sts_cache_dirpath.joinpath(f'{framework}_{model_size_limit[0]}_{model_size_limit[1]}.sts')
+def set_convert_status_last_handled_model_id(sts_cache_dirpath: pathlib.Path, framework: Literal['optimum', 'onnx', 'keras', 'tflite', 'stable_baselines3'], convert_status: dict[str, dict[str, Any]], model_id: str):
+    convert_status_filepath = sts_cache_dirpath.joinpath(f'{framework}.sts')
     with open(convert_status_filepath, 'a') as convert_status_file:
         convert_status_file.write(f'{saves_json((model_id, convert_status))}\n')
 
-    last_handled_filepath = sts_cache_dirpath.joinpath(f'{framework}_{model_size_limit[0]}_{model_size_limit[1]}_last_handled.sts')
+    last_handled_filepath = sts_cache_dirpath.joinpath(f'{framework}_last_handled.sts')
     with open(last_handled_filepath, 'w') as last_handled_file:
         last_handled_file.write(f'{model_id}\n')
 
@@ -636,8 +646,6 @@ def main(
     save_dirpath: pathlib.Path, cache_dirpath: pathlib.Path,
     device: Literal['cpu', 'cuda'] = 'cpu',
     framework: Literal['optimum', 'onnx', 'keras', 'tflite', 'stable_baselines3'] = 'optimum',
-    model_size_limit_l: int | None = None,
-    model_size_limit_r: int | None = None,
     token: str | None = None,
     estimate: bool = False,
 ):
@@ -674,16 +682,7 @@ def main(
         The Instances are saved into the directory named as 'Instances-HuggingFace-{Framework}' under the save_dirpath.
 
     """
-
-    model_size_limit_l = model_size_limit_l or 0
-    logger.info(f'   Model Size Left Limit: {get_human_readable_size_representation(model_size_limit_l)}.')
-
-    model_size_limit_r = model_size_limit_r or 1024 * 1024 * 1024 * 1024 * 1024
-    logger.info(f'   Model Size Right Limit: {get_human_readable_size_representation(model_size_limit_r)}.')
-
-    model_size_limit = (model_size_limit_l, model_size_limit_r)
-
-    model_infos, convert_method = get_model_infos_and_convert_method(model_infos_filepath, framework, model_size_limit)
+    model_infos, convert_method = get_model_infos_and_convert_method(model_infos_filepath, framework)
     if estimate:
         logger.info(f'Only Estimate. Models To Be Converted: {len(model_infos)}; Model Infos Filename: {model_infos_filepath.name}.')
         return
@@ -707,7 +706,8 @@ def main(
     # Status
     sts_cache_dirpath = cache_dirpath.joinpath(f'Cache-HFSts')
     create_dir(sts_cache_dirpath)
-    convert_status, last_handled_model_id = get_convert_status_and_last_handled_model_id(sts_cache_dirpath, framework, model_size_limit)
+    
+    convert_status, last_handled_model_id = get_convert_status_and_last_handled_model_id(sts_cache_dirpath, framework)
     number_of_converted_models = len(convert_status)
     logger.info(f'-> Previous Converted Models: {number_of_converted_models}')
 
@@ -717,10 +717,35 @@ def main(
     else:
         logger.info(f'-> HuggingFace Token Not Provided. Now Accessing Without Token ...')
 
+    hf_api = HfApi(token=token)
+    oversized_models_filepath = save_dirpath.joinpath(f'oversized_models_{framework}.jsonl')
+
     logger.info(f'-> Instances Creating ...')
     with tqdm.tqdm(total=len(model_infos), desc='Create Instances') as progress_bar:
         for convert_index, model_info in enumerate(model_infos, start=1):
             model_id = model_info['id']
+            
+            used_storage = model_info.get('usedStorage', 0)
+            if used_storage == 0:
+                try:
+                    live_info = hf_api.model_info(model_id, files_metadata=True)
+                    used_storage = sum(file.size for file in live_info.siblings if file.size is not None)
+                except Exception as e:
+                    logger.warning(f"-> 无法动态获取 {model_id} 的真实大小, 默认放行。错误: {e}")
+                    used_storage = 0
+
+            LIMIT_32GB = 32 * 1024 * 1024 * 1024  
+            
+            if used_storage > LIMIT_32GB:
+                logger.warning(f"-> Skip! Model {model_id} real size ({get_human_readable_size_representation(used_storage)}) exceeds 32GB.")
+                model_info['usedStorage_real'] = used_storage 
+                with open(oversized_models_filepath, 'a', encoding='utf-8') as f:
+                    f.write(saves_json(model_info) + '\n')
+                
+                progress_bar.set_description(f'Oversized, Skip - {model_id}')
+                progress_bar.update(1)
+                continue
+
             if framework == 'optimum':
                 #Selecting a matched library from tags when the framework of module is optimum
                 tags = set(model_info.get('tags', []))
@@ -735,6 +760,7 @@ def main(
             else:
                 #Other frameworks do not need library_name
                 library_name = None
+                
             if last_handled_model_id is not None:
                 if model_id == last_handled_model_id:
                     last_handled_model_id = None
@@ -769,7 +795,7 @@ def main(
             else:
                 save_json(readme, readmes_dirpath.joinpath(f'{model_owner}_YLIR_{model_name}.json'))
 
-            set_convert_status_last_handled_model_id(sts_cache_dirpath, framework, model_size_limit, status, model_id)
+            set_convert_status_last_handled_model_id(sts_cache_dirpath, framework, status, model_id)
             clean_cache(model_id, cvt_cache_dirpath, ofc_cache_dirpath)
 
             progress_bar.set_description(f'Convert - {model_id}')
